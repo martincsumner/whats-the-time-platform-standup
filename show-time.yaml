@@ -1,0 +1,40 @@
+---
+- name: Show whats-the-time environment routes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    validate_certs: false
+
+  tasks:
+    - name: Fetch routes for all three environments
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: whats-the-time
+        namespace: "{{ item }}"
+      register: all_routes
+      loop:
+        - whats-thetime-dev
+        - whats-thetime-test
+        - whats-thetime-prod
+      ignore_errors: true
+
+    - name: Display environment routes
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "  Exposed routes"
+          - "=============================================="
+          - "  dev  : {{ 'http://' + all_routes.results[0].resources[0].spec.host + '/time'
+              if all_routes.results[0].resources | length > 0
+              else 'not found — has ArgoCD synced dev?' }}"
+          - "  test : {{ 'http://' + all_routes.results[1].resources[0].spec.host + '/time'
+              if all_routes.results[1].resources | length > 0
+              else 'pending — trigger sync in ArgoCD' }}"
+          - "  prod : {{ 'http://' + all_routes.results[2].resources[0].spec.host + '/time'
+              if all_routes.results[2].resources | length > 0
+              else 'pending — trigger sync in ArgoCD' }}"
+          - "=============================================="

@@ -1,0 +1,80 @@
+---
+# clone-all-repos.yml
+#
+# Clones all companion repos for the whats-the-time lab alongside this repo.
+#
+# Run from inside the whats-the-time-platform-standup directory:
+#   ansible-playbook clone-all-repos.yml
+# Or from the parent directory:
+#   ansible-playbook whats-the-time-platform-standup/clone-all-repos.yml
+#
+# The playbook resolves the parent directory (gcb-demo-run/) relative to its own
+# location, so it works regardless of your current working directory.
+#
+# Prerequisites:
+#   global-var-secrets.txt must exist in the same directory as this playbook.
+#   Copy it from global-var-secrets.example and fill in real values:
+#
+#     cp global-var-secrets.example global-var-secrets.txt
+
+- name: Clone whats-the-time lab repos
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # All host/credential values come from global-var-secrets.txt so that
+  # gitea_host, gitea_username, and gitea_password are never hardwired here.
+  vars_files:
+    - global-var-secrets.txt
+
+  vars:
+    # Parent directory — one level above this playbook file (i.e. gcb-demo-run/)
+    lab_root: "{{ playbook_dir | realpath | dirname }}"
+
+    repos:
+      - repo: "whats-the-time-app"
+        dest: "whats-the-time-app"
+
+      - repo: "whats-the-time-argoconf"
+        dest: "whats-the-time-argoconf"
+
+      - repo: "whats-the-time-pipeline"
+        dest: "whats-the-time-pipeline"
+
+      - repo: "whats-the-time-cluster-conf"
+        dest: "whats-the-time-cluster-conf"
+
+  tasks:
+    - name: Ensure parent directories exist
+      ansible.builtin.file:
+        path: "{{ lab_root }}/{{ item.parent }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ repos | selectattr('parent', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.parent }}"
+
+    - name: Clone repos
+      ansible.builtin.git:
+        repo: "http://{{ gitea_host }}/{{ gitea_username }}/{{ item.repo }}.git"
+        dest: "{{ lab_root }}/{{ item.dest }}"
+        version: main
+        update: false          # skip if already cloned; set to true to pull updates
+        accept_hostkey: true
+      environment:
+        GIT_USERNAME: "{{ gitea_username }}"
+        GIT_PASSWORD: "{{ gitea_password }}"
+      loop: "{{ repos }}"
+      loop_control:
+        label: "{{ item.repo }}"
+      register: clone_results
+
+    - name: Report results
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.repo }}:
+          {{ 'cloned' if item.changed else 'already present (skipped)' }}
+          → {{ lab_root }}/{{ item.item.dest }}
+      loop: "{{ clone_results.results }}"
+      loop_control:
+        label: "{{ item.item.repo }}"

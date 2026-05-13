@@ -1,0 +1,645 @@
+---
+- name: Install OpenShift Pipelines and GitOps Operators on CRC
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - global-var-secrets.txt
+
+  vars:
+    crc_api_url: "https://api.crc.testing:6443"
+    crc_username: "kubeadmin"
+    validate_certs: false
+
+    pipelines_operator:
+      namespace: openshift-operators
+      channel: latest
+      package_name: openshift-pipelines-operator-rh
+      source: redhat-operators
+      source_namespace: openshift-marketplace
+
+    gitops_operator:
+      namespace: openshift-operators
+      channel: latest
+      package_name: openshift-gitops-operator
+      source: redhat-operators
+      source_namespace: openshift-marketplace
+
+    argocd_namespace: openshift-gitops
+
+    # Derived repo URLs — built from global-var-secrets.txt values.
+    # Do not hardwire these; change gitea_host / gitea_username in global-var-secrets.txt instead.
+    gitea_base_url: "http://{{ gitea_host }}"
+    gitea_argoconf_repo: "http://{{ gitea_host }}/{{ gitea_username }}/whats-the-time-argoconf.git"
+    gitea_app_repo: "http://{{ gitea_host }}/{{ gitea_username }}/whats-the-time-app.git"
+
+    app_namespaces:
+      - whats-thetime-dev
+      - whats-thetime-test
+      - whats-thetime-prod
+
+    cluster_conf_dir: "{{ playbook_dir }}/../whats-the-time-cluster-conf"
+    pipeline_conf_dir: "{{ playbook_dir }}/../whats-the-time-pipeline"
+
+    # Rendered manifests directory — Ansible writes variable-substituted YAML here
+    # before applying it to the cluster.  Listed in .gitignore.
+    rendered_dir: "{{ playbook_dir }}/.rendered"
+
+  tasks:
+    # ── Pre-flight checks ─────────────────────────────────────────────────────
+
+    - name: Ensure global-var-secrets.txt exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/global-var-secrets.txt"
+      register: secrets_file
+      failed_when: not secrets_file.stat.exists
+      changed_when: false
+      no_log: true
+
+    - name: Ensure crc_password is set
+      ansible.builtin.assert:
+        that: crc_password | default('') | length > 0
+        fail_msg: "crc_password is missing or empty in global-var-secrets.txt"
+
+    - name: Ensure gitea_host is set
+      ansible.builtin.assert:
+        that: gitea_host | default('') | length > 0
+        fail_msg: "gitea_host is missing or empty in global-var-secrets.txt"
+
+    - name: Ensure gitea_password is set
+      ansible.builtin.assert:
+        that: gitea_password | default('') | length > 0
+        fail_msg: "gitea_password is missing or empty in global-var-secrets.txt"
+
+    - name: Ensure quay_robot_token is set
+      ansible.builtin.assert:
+        that: quay_robot_token | default('') | length > 0
+        fail_msg: "quay_robot_token is missing or empty in global-var-secrets.txt"
+
+    - name: Ensure quay_image is set
+      ansible.builtin.assert:
+        that: quay_image | default('') | length > 0
+        fail_msg: "quay_image is missing or empty in global-var-secrets.txt"
+
+    - name: Ensure crc_apps_domain is set
+      ansible.builtin.assert:
+        that: crc_apps_domain | default('') | length > 0
+        fail_msg: "crc_apps_domain is missing or empty in global-var-secrets.txt"
+
+    # ── Render templates ──────────────────────────────────────────────────────
+    # Jinja2 templates in the sibling repos contain {{ variable }} placeholders.
+    # Ansible renders them into .rendered/ before applying so no paths are ever
+    # hardwired in the checked-in YAML files.
+
+    - name: Create rendered manifests directory
+      ansible.builtin.file:
+        path: "{{ rendered_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Render ArgoCD Application manifests
+      ansible.builtin.template:
+        src: "{{ cluster_conf_dir }}/{{ item }}.j2"
+        dest: "{{ rendered_dir }}/{{ item }}"
+        mode: "0640"
+      loop:
+        - argocd-app-dev.yaml
+        - argocd-app-test.yaml
+        - argocd-app-prod.yaml
+
+    - name: Render Tekton Pipeline manifests
+      ansible.builtin.template:
+        src: "{{ pipeline_conf_dir }}/{{ item }}.j2"
+        dest: "{{ rendered_dir }}/{{ item }}"
+        mode: "0640"
+      loop:
+        - whats-the-time-pipeline.yaml
+        - promote-to-test-pipeline.yaml
+        - promote-to-prod-pipeline.yaml
+
+    # ── Cluster login ─────────────────────────────────────────────────────────
+
+    - name: Log in to CRC cluster
+      ansible.builtin.command:
+        cmd: >
+          oc login {{ crc_api_url }}
+          --username={{ crc_username }}
+          --password={{ crc_password }}
+          --insecure-skip-tls-verify=true
+      changed_when: true
+      no_log: true
+      register: oc_login_result
+      failed_when: false
+
+    - name: Fail with helpful message if login failed
+      ansible.builtin.fail:
+        msg: >
+          oc login failed (exit code {{ oc_login_result.rc }}).
+          Check that CRC is running ('crc status') and that crc_password
+          in global-var-secrets.txt is correct.
+          Retrieve with: crc console --credentials -o json | jq -r '.clusterConfig.adminCredentials.password'
+      when: oc_login_result.rc != 0
+
+    - name: Retrieve cluster kubeconfig context
+      ansible.builtin.command:
+        cmd: oc whoami --show-context
+      register: oc_context
+      changed_when: false
+
+    - name: Show active context
+      ansible.builtin.debug:
+        msg: "Connected to cluster as context: {{ oc_context.stdout }}"
+
+    - name: Create OpenShift Pipelines Subscription
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: openshift-pipelines-operator
+            namespace: "{{ pipelines_operator.namespace }}"
+          spec:
+            channel: "{{ pipelines_operator.channel }}"
+            name: "{{ pipelines_operator.package_name }}"
+            source: "{{ pipelines_operator.source }}"
+            sourceNamespace: "{{ pipelines_operator.source_namespace }}"
+            installPlanApproval: Automatic
+
+    - name: Wait for Pipelines CSV to appear
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ pipelines_operator.namespace }}"
+        label_selectors:
+          - "operators.coreos.com/openshift-pipelines-operator-rh.openshift-operators"
+      register: pipelines_csv
+      retries: 20
+      delay: 15
+      until: >
+        pipelines_csv.resources | length > 0 and
+        (pipelines_csv.resources | selectattr('status.phase', 'defined') |
+         selectattr('status.phase', 'equalto', 'Succeeded') | list | length > 0)
+
+    - name: Show installed Pipelines CSV version
+      ansible.builtin.debug:
+        msg: "OpenShift Pipelines installed: {{ pipelines_csv.resources[0].metadata.name }}"
+
+    - name: Verify Tekton pipelines CRD is available
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: pipelines.tekton.dev
+      register: tekton_crd
+      retries: 10
+      delay: 10
+      until: tekton_crd.resources | length > 0
+
+    - name: Confirm Pipelines installation complete
+      ansible.builtin.debug:
+        msg: "OpenShift Pipelines operator is installed and Tekton CRDs are available."
+
+    # ── OpenShift GitOps (ArgoCD) ─────────────────────────────────────────────
+
+    - name: Create OpenShift GitOps Subscription
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: openshift-gitops-operator
+            namespace: "{{ gitops_operator.namespace }}"
+          spec:
+            channel: "{{ gitops_operator.channel }}"
+            name: "{{ gitops_operator.package_name }}"
+            source: "{{ gitops_operator.source }}"
+            sourceNamespace: "{{ gitops_operator.source_namespace }}"
+            installPlanApproval: Automatic
+
+    - name: Wait for GitOps CSV to appear and succeed
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ gitops_operator.namespace }}"
+        label_selectors:
+          - "operators.coreos.com/openshift-gitops-operator.openshift-operators"
+      register: gitops_csv
+      retries: 30
+      delay: 15
+      until: >
+        gitops_csv.resources | length > 0 and
+        (gitops_csv.resources | selectattr('status.phase', 'defined') |
+         selectattr('status.phase', 'equalto', 'Succeeded') | list | length > 0)
+
+    - name: Show installed GitOps CSV version
+      ansible.builtin.debug:
+        msg: "OpenShift GitOps installed: {{ gitops_csv.resources[0].metadata.name }}"
+
+    - name: Wait for ArgoCD CRD to be available
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: argocds.argoproj.io
+      register: argocd_crd
+      retries: 10
+      delay: 10
+      until: argocd_crd.resources | length > 0
+
+    - name: Wait for default ArgoCD instance to be available
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: openshift-gitops-server
+        namespace: "{{ argocd_namespace }}"
+      register: argocd_server
+      retries: 20
+      delay: 15
+      until: >
+        argocd_server.resources | length > 0 and
+        (argocd_server.resources[0].status.availableReplicas | default(0)) >= 1
+
+    - name: Confirm ArgoCD is ready
+      ansible.builtin.debug:
+        msg: "ArgoCD instance is running in namespace '{{ argocd_namespace }}'."
+
+    - name: Create cluster-admins group and add kubeadmin
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: user.openshift.io/v1
+          kind: Group
+          metadata:
+            name: cluster-admins
+          users:
+            - kubeadmin
+
+    - name: Grant kubeadmin ArgoCD admin role
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: argoproj.io/v1alpha1
+          kind: ArgoCD
+          metadata:
+            name: openshift-gitops
+            namespace: "{{ argocd_namespace }}"
+          spec:
+            rbac:
+              policy: |
+                g, system:cluster-admins, role:admin
+                g, cluster-admins, role:admin
+                g, kubeadmin, role:admin
+
+    # ── Namespaces and RBAC ───────────────────────────────────────────────────
+
+    - name: Apply cluster namespaces
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        src: "{{ cluster_conf_dir }}/namespaces.yml"
+
+    - name: Label application namespaces for ArgoCD management
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item }}"
+            labels:
+              argocd.argoproj.io/managed-by: "{{ argocd_namespace }}"
+      loop: "{{ app_namespaces }}"
+
+    # ── ArgoCD repository credentials ─────────────────────────────────────────
+
+    - name: Create Gitea repository secret in ArgoCD namespace
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: gitea-argo-whatsthetime-conf
+            namespace: "{{ argocd_namespace }}"
+            labels:
+              argocd.argoproj.io/secret-type: repository
+          stringData:
+            type: git
+            url: "{{ gitea_argoconf_repo }}"
+            username: "{{ gitea_username }}"
+            password: "{{ gitea_password }}"
+      no_log: true
+
+    # ── Pipeline secrets ─────────────────────────────────────────────────────
+
+    - name: Create Tekton git credentials secret
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: whats-the-time-git-secret
+            namespace: whats-the-time-pipelines
+          type: Opaque
+          stringData:
+            .gitconfig: |
+              [credential]
+                helper = store
+            .git-credentials: |
+              http://{{ gitea_username }}:{{ gitea_password | urlencode }}@{{ gitea_host }}
+      no_log: true
+
+    - name: Create Tekton registry credentials secret
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: whats-the-time-registry-secret
+            namespace: whats-the-time-pipelines
+          type: kubernetes.io/dockerconfigjson
+          stringData:
+            .dockerconfigjson: "{{ {'auths': {'quay.io': {'auth': (quay_robot_username + ':' + quay_robot_token) | b64encode, 'email': ''}}} | to_json }}"
+      no_log: true
+
+    # ── Pipeline definitions ──────────────────────────────────────────────────
+
+    - name: Apply shared update-gitops-overlay Task
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        src: "{{ cluster_conf_dir }}/task-update-gitops-overlay.yaml"
+
+    - name: Apply pipeline definitions
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        src: "{{ rendered_dir }}/{{ item }}"
+      loop:
+        - whats-the-time-pipeline.yaml
+        - promote-to-test-pipeline.yaml
+        - promote-to-prod-pipeline.yaml
+
+    - name: Trigger initial build PipelineRun
+      ansible.builtin.command:
+        cmd: oc create -f {{ pipeline_conf_dir }}/whats-the-time-pipelinerun.yaml
+      changed_when: true
+
+    # Seed runs for the promotion pipelines — these register the workspace
+    # bindings in the console so subsequent starts are pre-populated and
+    # one-click. They will run immediately but are harmless on a fresh cluster
+    # (they simply copy whatever digest is currently in the gitops overlays).
+    - name: Seed promote-to-test PipelineRun
+      ansible.builtin.command:
+        cmd: oc create -f {{ pipeline_conf_dir }}/promote-to-test-pipelinerun.yaml
+      changed_when: true
+
+    - name: Seed promote-to-prod PipelineRun
+      ansible.builtin.command:
+        cmd: oc create -f {{ pipeline_conf_dir }}/promote-to-prod-pipelinerun.yaml
+      changed_when: true
+
+    # ── ArgoCD Application CRs ────────────────────────────────────────────────
+
+    - name: Apply ArgoCD Application for dev
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        src: "{{ rendered_dir }}/argocd-app-dev.yaml"
+
+    - name: Apply ArgoCD Application for test
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        src: "{{ rendered_dir }}/argocd-app-test.yaml"
+
+    - name: Apply ArgoCD Application for prod
+      kubernetes.core.k8s:
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        src: "{{ rendered_dir }}/argocd-app-prod.yaml"
+
+    # ── Console plugins ───────────────────────────────────────────────────────
+    # Wait for each operator to register its ConsolePlugin resource before
+    # patching the Console CR — the plugins are created after the CSV succeeds
+    # but only once the operator's full pod fleet is healthy.
+
+    - name: Wait for gitops-plugin ConsolePlugin to be registered
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: console.openshift.io/v1
+        kind: ConsolePlugin
+        name: gitops-plugin
+      register: gitops_plugin_cr
+      retries: 20
+      delay: 15
+      until: gitops_plugin_cr.resources | length > 0
+
+    - name: Wait for pipelines-console-plugin ConsolePlugin to be registered
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: console.openshift.io/v1
+        kind: ConsolePlugin
+        name: pipelines-console-plugin
+      register: pipelines_plugin_cr
+      retries: 20
+      delay: 15
+      until: pipelines_plugin_cr.resources | length > 0
+
+    - name: Read current console plugin list
+      ansible.builtin.command:
+        cmd: oc get console.operator.openshift.io cluster -o json
+      register: console_cr_raw
+      changed_when: false
+
+    - name: Enable Pipelines and GitOps console plugins
+      vars:
+        _current: "{{ (console_cr_raw.stdout | from_json).spec.plugins | default([]) }}"
+        _desired: "{{ (_current + ['gitops-plugin', 'pipelines-console-plugin']) | unique }}"
+      ansible.builtin.shell:
+        cmd: >
+          oc patch console.operator.openshift.io cluster --type=merge
+          -p {{ {"spec": {"plugins": _desired}} | to_json | quote }}
+      when: >
+        'gitops-plugin' not in _current or
+        'pipelines-console-plugin' not in _current
+      changed_when: true
+
+    - name: Wait for console rollout to pick up plugin changes
+      ansible.builtin.command:
+        cmd: oc rollout status deployment/console -n openshift-console --timeout=120s
+      changed_when: false
+
+    - name: Confirm console plugins enabled
+      ansible.builtin.debug:
+        msg: "Console plugins enabled: pipelines-console-plugin, gitops-plugin"
+
+    - name: Confirm GitOps configuration complete
+      ansible.builtin.debug:
+        msg: >
+          ArgoCD Applications created: whats-the-time-dev (auto-sync),
+          whats-the-time-test (manual), whats-the-time-prod (manual).
+          Watching: {{ gitea_argoconf_repo }}
+
+    # ── Environment routes ────────────────────────────────────────────────────
+    # Dev auto-syncs so we wait for its route; test and prod require a manual
+    # ArgoCD sync so we display them if present, otherwise note they are pending.
+
+    - name: Wait for ArgoCD to auto-sync dev and expose route
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: whats-the-time
+        namespace: whats-thetime-dev
+      register: dev_route
+      retries: 20
+      delay: 15
+      until: dev_route.resources | length > 0
+
+    - name: Fetch test and prod routes (manual sync — may not exist yet)
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: whats-the-time
+        namespace: "{{ item }}"
+      register: promotion_routes
+      loop:
+        - whats-thetime-test
+        - whats-thetime-prod
+      ignore_errors: true
+
+    - name: Display environment routes
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "  Exposed routes"
+          - "=============================================="
+          - "  dev  : http://{{ dev_route.resources[0].spec.host }}/time"
+          - "  test : {{ 'http://' + promotion_routes.results[0].resources[0].spec.host + '/time'
+              if promotion_routes.results[0].resources | length > 0
+              else 'pending — trigger sync in ArgoCD' }}"
+          - "  prod : {{ 'http://' + promotion_routes.results[1].resources[0].spec.host + '/time'
+              if promotion_routes.results[1].resources | length > 0
+              else 'pending — trigger sync in ArgoCD' }}"
+          - "=============================================="
+
+    # ── Installation tests ────────────────────────────────────────────────────
+
+    - name: TEST - Read namespaces
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ item }}"
+      register: test_namespaces
+      loop:
+        - whats-thetime-dev
+        - whats-thetime-test
+        - whats-thetime-prod
+        - whats-the-time-pipelines
+
+    - name: TEST - Read pipeline definitions
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: tekton.dev/v1
+        kind: Pipeline
+        name: "{{ item }}"
+        namespace: whats-the-time-pipelines
+      register: test_pipelines
+      loop:
+        - whats-the-time-pipeline
+        - promote-to-test-pipeline
+        - promote-to-prod-pipeline
+
+    - name: TEST - Read pipeline secrets
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: v1
+        kind: Secret
+        name: "{{ item }}"
+        namespace: whats-the-time-pipelines
+      register: test_pipeline_secrets
+      loop:
+        - whats-the-time-git-secret
+        - whats-the-time-registry-secret
+
+    - name: TEST - Read ArgoCD Applications
+      kubernetes.core.k8s_info:
+        validate_certs: "{{ validate_certs }}"
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        name: "{{ item }}"
+        namespace: "{{ argocd_namespace }}"
+      register: test_argocd_apps
+      loop:
+        - whats-the-time-dev
+        - whats-the-time-test
+        - whats-the-time-prod
+
+    - name: TEST - Re-read Console CR for plugin verification
+      ansible.builtin.command:
+        cmd: oc get console.operator.openshift.io cluster -o json
+      register: test_console_raw
+      changed_when: false
+
+    - name: Display test results
+      vars:
+        _console_plugins: "{{ (test_console_raw.stdout | from_json).spec.plugins | default([]) }}"
+        _pipelines_ok: "{{ pipelines_csv.resources | length > 0 and
+          (pipelines_csv.resources | selectattr('status.phase', 'defined') |
+           selectattr('status.phase', 'equalto', 'Succeeded') | list | length > 0) }}"
+        _gitops_ok: "{{ gitops_csv.resources | length > 0 and
+          (gitops_csv.resources | selectattr('status.phase', 'defined') |
+           selectattr('status.phase', 'equalto', 'Succeeded') | list | length > 0) }}"
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "  Installation Test Results"
+          - "=============================================="
+          - "  {{ '[PASS]' if _pipelines_ok else '[FAIL]' }} Pipelines operator : {{ pipelines_csv.resources[0].metadata.name | default('not found') }}"
+          - "  {{ '[PASS]' if _gitops_ok else '[FAIL]' }} GitOps operator    : {{ gitops_csv.resources[0].metadata.name | default('not found') }}"
+          - "  {{ '[PASS]' if (argocd_server.resources[0].status.availableReplicas | default(0)) >= 1 else '[FAIL]' }} ArgoCD instance    : available"
+          - "  ---"
+          - "  {{ '[PASS]' if test_namespaces.results[0].resources | length > 0 else '[FAIL]' }} Namespace          : whats-thetime-dev"
+          - "  {{ '[PASS]' if test_namespaces.results[1].resources | length > 0 else '[FAIL]' }} Namespace          : whats-thetime-test"
+          - "  {{ '[PASS]' if test_namespaces.results[2].resources | length > 0 else '[FAIL]' }} Namespace          : whats-thetime-prod"
+          - "  {{ '[PASS]' if test_namespaces.results[3].resources | length > 0 else '[FAIL]' }} Namespace          : whats-the-time-pipelines"
+          - "  ---"
+          - "  {{ '[PASS]' if gitops_plugin_cr.resources | length > 0 else '[FAIL]' }} ConsolePlugin      : gitops-plugin registered"
+          - "  {{ '[PASS]' if pipelines_plugin_cr.resources | length > 0 else '[FAIL]' }} ConsolePlugin      : pipelines-console-plugin registered"
+          - "  {{ '[PASS]' if 'gitops-plugin' in _console_plugins else '[FAIL]' }} Console CR         : gitops-plugin enabled"
+          - "  {{ '[PASS]' if 'pipelines-console-plugin' in _console_plugins else '[FAIL]' }} Console CR         : pipelines-console-plugin enabled"
+          - "  ---"
+          - "  {{ '[PASS]' if test_pipelines.results[0].resources | length > 0 else '[FAIL]' }} Pipeline           : whats-the-time-pipeline"
+          - "  {{ '[PASS]' if test_pipelines.results[1].resources | length > 0 else '[FAIL]' }} Pipeline           : promote-to-test-pipeline"
+          - "  {{ '[PASS]' if test_pipelines.results[2].resources | length > 0 else '[FAIL]' }} Pipeline           : promote-to-prod-pipeline"
+          - "  ---"
+          - "  {{ '[PASS]' if test_pipeline_secrets.results[0].resources | length > 0 else '[FAIL]' }} Pipeline secret    : whats-the-time-git-secret"
+          - "  {{ '[PASS]' if test_pipeline_secrets.results[1].resources | length > 0 else '[FAIL]' }} Pipeline secret    : whats-the-time-registry-secret"
+          - "  ---"
+          - "  {{ '[PASS]' if test_argocd_apps.results[0].resources | length > 0 else '[FAIL]' }} ArgoCD App         : whats-the-time-dev"
+          - "  {{ '[PASS]' if test_argocd_apps.results[1].resources | length > 0 else '[FAIL]' }} ArgoCD App         : whats-the-time-test"
+          - "  {{ '[PASS]' if test_argocd_apps.results[2].resources | length > 0 else '[FAIL]' }} ArgoCD App         : whats-the-time-prod"
+          - "  ---"
+          - "  {{ '[PASS]' if dev_route.resources | length > 0 else '[FAIL]' }} Dev route          : {{ 'http://' + dev_route.resources[0].spec.host + '/time' if dev_route.resources | length > 0 else 'not found' }}"
+          - "  {{ '[PASS]' if promotion_routes.results[0].resources | length > 0 else '[WAIT]' }} Test route         : {{ 'http://' + promotion_routes.results[0].resources[0].spec.host + '/time' if promotion_routes.results[0].resources | length > 0 else 'pending manual ArgoCD sync' }}"
+          - "  {{ '[PASS]' if promotion_routes.results[1].resources | length > 0 else '[WAIT]' }} Prod route         : {{ 'http://' + promotion_routes.results[1].resources[0].spec.host + '/time' if promotion_routes.results[1].resources | length > 0 else 'pending manual ArgoCD sync' }}"
+          - "=============================================="
