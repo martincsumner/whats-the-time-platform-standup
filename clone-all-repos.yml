@@ -56,7 +56,7 @@
 
     - name: Clone repos
       ansible.builtin.git:
-        repo: "http://{{ gitea_host }}/{{ gitea_username }}/{{ item.repo }}.git"
+        repo: "{{ gitea_host }}/{{ gitea_username }}/{{ item.repo }}.git"
         dest: "{{ lab_root }}/{{ item.dest }}"
         version: main
         update: false          # skip if already cloned; set to true to pull updates
