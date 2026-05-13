@@ -3,12 +3,12 @@
 #  Create your secrets file (one-time setup — never committed to git)
 
 All the playbooks use variables that are declared in the global-var-secrets.txt file located in this project. 
-You have to create this first off. 
+But you have to create this first off. 
 
 ```
 cp global-var-secrets.example global-var-secrets.txt
 ```
-Presently it is pointing to my public github repo, so to get the rest of the code you will need:
+Presently it is pointing to my public github repo, so to get the rest of the code you will need to do the following:
 
     ansible-playbook clone-all-repos.yml
 
@@ -19,8 +19,9 @@ Presently it is pointing to my public github repo, so to get the rest of the cod
 ## Prerequisites
 
 ## GIT
-Copy the code into a git repository that you have control of, the pipeline will need to read and write to the repo called whats-the-time-argoconf, but actually you will most likely want to tweak the application code etc. so copy all of it.
+Copy the code into a git repository that you have control of, the pipeline will need to read and write to the repo called whats-the-time-argoconf, but actually you will most likely want to tweak the application code etc. - so copy all of it to your own git instance and from here work directly from that.
 
+remember to change the path in the global-vars-secrets.txt file to reflect your env. 
 
 ## A docker registry you can push images to.
 I have used a quay.io account, you can use this for free, just create a robot account - which will 
