@@ -1,4 +1,20 @@
 
+## FIRST TASK GET THE CODE.
+#  Create your secrets file (one-time setup — never committed to git)
+
+All the playbooks use variables that are declared in the global-var-secrets.txt file located in this project. 
+You have to create this first off. 
+
+```
+cp global-var-secrets.example global-var-secrets.txt
+```
+Presently it is pointing to my public github repo, so to get the rest of the code you will need:
+
+    ansible-playbook clone-all-repos.yml
+
+
+==============================================================================
+
 
 ## Prerequisites
 
@@ -55,8 +71,7 @@ and copy it to somewhere on your local file system
 # 1. Start CRC
 crc start -p /Users/msumner/pull-secret.txt
 
-# 2. Create your secrets file (one-time setup — never committed to git)
-cp global-var-secrets.example global-var-secrets.txt
+
 
 # Edit global-var-secrets.txt and fill in real values:
 #   crc_password   — retrieve with: crc console --credentials -o json | jq -r '.clusterConfig.adminCredentials.password'
